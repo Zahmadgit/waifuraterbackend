@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 dotenv.config();
 import express from "express";
 import { MongoClient, ServerApiVersion } from "mongodb";
+import jwt from "jsonwebtoken";
 
 const app = express();
 app.use(cors());
@@ -33,8 +34,12 @@ async function main() {
 
     app.use(express.json());
 
-    // Health check root route
-    app.get("/", (req, res) => res.send("OK"));
+    // Health check root route and issue JWT token
+    app.get("/", (req, res) => {
+      const user = { name: "guest" };
+      const token = jwt.sign(user, process.env.JWT_SECRET, { expiresIn: "1h" });
+      res.json({ token });
+    });
 
     // Define GET endpoint
     app.get("/items", async (req, res) => {
@@ -47,51 +52,56 @@ async function main() {
       }
     });
 
-    // Define POST endpoint for updating waifu stats
-    app.post("/waifu/update", async (req, res) => {
-      const { id, field, operation } = req.body;
+    // JWT authentication middleware
+    const authenticateToken = (req, res, next) => {
+      const authHeader = req.headers["authorization"];
+      const token = authHeader && authHeader.split(" ")[1]; // Expect "Bearer <token>"
+      if (!token) return res.sendStatus(401);
+      jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) return res.sendStatus(403);
+        req.user = user;
+        next();
+      });
+    };
+
+    // Define POST endpoint for updating both winner and loser waifu stats (protected)
+    app.post("/waifu/update", authenticateToken, async (req, res) => {
+      const { winner, loser } = req.body;
       if (
-        !id ||
-        !["wins", "losses"].includes(field) ||
-        !["increment", "decrement"].includes(operation)
+        !winner ||
+        !loser ||
+        !winner.id ||
+        !loser.id ||
+        !winner.imageUrl ||
+        !loser.imageUrl ||
+        !winner.source ||
+        !loser.source ||
+        !["wins", "losses"].includes(winner.field) ||
+        !["wins", "losses"].includes(loser.field) ||
+        !["increment", "decrement"].includes(winner.operation) ||
+        !["increment", "decrement"].includes(loser.operation)
       ) {
         return res.status(400).json({ error: "Invalid request body" });
       }
 
-      const updateValue = operation === "increment" ? 1 : 1;
+      const winnerUpdateValue = winner.operation === "increment" ? 1 : -1;
+      const loserUpdateValue = loser.operation === "increment" ? 1 : -1;
 
       try {
         const collection = client.db(dbName).collection(collectionName);
-        const result = await collection.updateOne(
-          { "waifus.id": id },
-          { $inc: { [`waifus.$.${field}`]: updateValue } }
-        );
-        if (result.modifiedCount === 0) {
-          return res.status(404).json({ error: "Waifu not found" });
-        }
-        res.json({ success: true });
-      } catch (err) {
-        res.status(500).json({ error: err.message });
-      }
-    });
-
-    // Define POST endpoint for comparing two waifus
-    app.post("/waifu/compare", async (req, res) => {
-      const { winner, loser } = req.body;
-      if (!winner || !loser || !winner.id || !loser.id) {
-        return res.status(400).json({ error: "Invalid request body" });
-      }
-
-      const collection = client.db(dbName).collection(collectionName);
-
-      try {
-        // Update winner: increment wins if exists
-        let result = await collection.updateOne(
+        // Update winner
+        let winnerResult = await collection.updateOne(
           { "waifus.id": winner.id },
-          { $inc: { "waifus.$.wins": 1 } }
+          { $inc: { [`waifus.$.${winner.field}`]: winnerUpdateValue } }
         );
-        // If winner not found, add to array
-        if (result.modifiedCount === 0) {
+        if (winnerResult.modifiedCount === 0) {
+          // Add winner if not found
+          const wins =
+            winner.field === "wins" && winner.operation === "increment" ? 1 : 0;
+          const losses =
+            winner.field === "losses" && winner.operation === "increment"
+              ? 1
+              : 0;
           await collection.updateOne(
             {},
             {
@@ -99,21 +109,25 @@ async function main() {
                 waifus: {
                   id: winner.id,
                   imageUrl: winner.imageUrl,
-                  wins: 1,
-                  losses: 0,
+                  source: winner.source,
+                  wins,
+                  losses,
                 },
               },
             }
           );
         }
-
-        // Update loser: increment losses if exists
-        result = await collection.updateOne(
+        // Update loser
+        let loserResult = await collection.updateOne(
           { "waifus.id": loser.id },
-          { $inc: { "waifus.$.losses": 1 } }
+          { $inc: { [`waifus.$.${loser.field}`]: loserUpdateValue } }
         );
-        // If loser not found, add to array
-        if (result.modifiedCount === 0) {
+        if (loserResult.modifiedCount === 0) {
+          // Add loser if not found
+          const wins =
+            loser.field === "wins" && loser.operation === "increment" ? 1 : 0;
+          const losses =
+            loser.field === "losses" && loser.operation === "increment" ? 1 : 0;
           await collection.updateOne(
             {},
             {
@@ -121,14 +135,14 @@ async function main() {
                 waifus: {
                   id: loser.id,
                   imageUrl: loser.imageUrl,
-                  wins: 0,
-                  losses: 1,
+                  source: loser.source,
+                  wins,
+                  losses,
                 },
               },
             }
           );
         }
-
         res.json({ success: true });
       } catch (err) {
         res.status(500).json({ error: err.message });
